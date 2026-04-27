@@ -26,6 +26,7 @@ kubectl get pods -A
 
 ## CI/CD Stack
 - **Source:** GitHub (via CodeStar Connection)
+- **GitHub Repo:** https://github.com/gilangarievanda/CICD-Demo.git
 - **CI/CD:** AWS CodePipeline + CodeBuild
 - **Container Registry:** Amazon ECR (repo: `cicd-demo`)
 - **Deploy Target:** EKS Auto Mode
