@@ -1,0 +1,38 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: ap-southeast-1
+    CODEDEPLOY_APP: cicd-demo
+    CODEDEPLOY_GROUP: dev-deployment-group
+    S3_BUCKET_NAME: cicd-demo-deploy-artifacts
+
+phases:
+  pre_build:
+    commands:
+      - echo "=== Running tests ==="
+      - cd app && npm ci && npm test && cd ..
+
+  build:
+    commands:
+      - echo "=== Packaging for CodeDeploy ==="
+      - DEPLOY_BUNDLE=cicd-demo-dev-$CODEBUILD_RESOLVED_SOURCE_VERSION.zip
+      - aws deploy push
+          --application-name $CODEDEPLOY_APP
+          --s3-location s3://$S3_BUCKET_NAME/$DEPLOY_BUNDLE
+          --source .
+          --description "Build $CODEBUILD_BUILD_NUMBER - commit $CODEBUILD_RESOLVED_SOURCE_VERSION"
+
+  post_build:
+    commands:
+      - echo "=== Triggering CodeDeploy ==="
+      - DEPLOYMENT_ID=$(aws deploy create-deployment
+          --application-name $CODEDEPLOY_APP
+          --deployment-group-name $CODEDEPLOY_GROUP
+          --s3-location bucket=$S3_BUCKET_NAME,key=$DEPLOY_BUNDLE,bundleType=zip
+          --description "Auto deploy from CodeBuild $CODEBUILD_BUILD_NUMBER"
+          --query 'deploymentId' --output text)
+      - echo "Deployment ID $DEPLOYMENT_ID"
+      - echo "Waiting for deployment to complete..."
+      - aws deploy wait deployment-successful --deployment-id $DEPLOYMENT_ID
+      - echo "=== Dev deployment successful! ==="

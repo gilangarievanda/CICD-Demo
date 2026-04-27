@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EC2 instance acting as on-premise dev environment with CodeDeploy agent
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  MyPublicIP:
+    Type: String
+    Default: 103.109.203.242/32
+    Description: Your laptop public IP for SSH access
+  KeyPairName:
+    Type: String
+    Description: Existing EC2 Key Pair name for SSH access
+
+Resources:
+  # --- Security Group ---
+  DevSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for dev on-premise EC2
+      VpcId: vpc-0542696855b501d38
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyPublicIP
+          Description: SSH from my laptop
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          Description: App port from anywhere
+      Tags:
+        - Key: Name
+          Value: cicd-demo-dev-sg
+
+  # --- IAM Role for EC2 (CodeDeploy agent + SSM) ---
+  DevInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cicd-demo-dev-ec2-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Tags:
+        - Key: Name
+          Value: cicd-demo-dev-ec2-role
+
+  DevInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DevInstanceRole
+
+  # --- EC2 Instance ---
+  DevInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref DevInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: subnet-005a1c2867c59092b
+          AssociatePublicIpAddress: true
+          GroupSet:
+            - !GetAtt DevSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: cicd-demo-dev
+        - Key: Environment
+          Value: development
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # Update system
+          yum update -y
+
+          # Install Node.js 20
+          curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+          yum install -y nodejs
+
+          # Install CodeDeploy agent
+          yum install -y ruby wget
+          cd /home/ec2-user
+          wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+          chmod +x ./install
+          ./install auto
+          systemctl enable codedeploy-agent
+          systemctl start codedeploy-agent
+
+          # Create app directory
+          mkdir -p /opt/cicd-demo
+          chown ec2-user:ec2-user /opt/cicd-demo
+
+          # Signal success
+          echo "UserData completed successfully" > /tmp/userdata-status.txt
+
+
+  # --- CodeDeploy Service Role ---
+  # NOTE: CodeDeploy Application 'cicd-demo' already exists (created outside this stack)
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cicd-demo-codedeploy-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  DevDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: cicd-demo
+      DeploymentGroupName: dev-deployment-group
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      Ec2TagFilters:
+        - Key: Name
+          Value: cicd-demo-dev
+          Type: KEY_AND_VALUE
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+
+Outputs:
+  InstanceId:
+    Value: !Ref DevInstance
+  PublicIP:
+    Value: !GetAtt DevInstance.PublicIp
+  SecurityGroupId:
+    Value: !GetAtt DevSecurityGroup.GroupId
+  DeploymentGroup:
+    Value: !Ref DevDeploymentGroup

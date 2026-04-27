@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CI/CD Pipeline: GitHub → CodeBuild (test) → CodeDeploy (dev) → Manual Approval → CodeBuild (build+deploy EKS prod)
+
+Parameters:
+  GitHubConnectionArn:
+    Type: String
+    Description: ARN of the CodeStar Connection to GitHub
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner/org
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+  GitHubBranch:
+    Type: String
+    Default: main
+  EKSClusterName:
+    Type: String
+    Default: curious-alternative-shark-Gilang
+  ECRRepoName:
+    Type: String
+    Default: cicd-demo
+  ApprovalNotifyEmail:
+    Type: String
+    Description: Email for manual approval notifications
+
+Resources:
+  # --- S3 Buckets ---
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub cicd-demo-pipeline-artifacts-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+
+  DeployArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub cicd-demo-deploy-artifacts
+      VersioningConfiguration:
+        Status: Enabled
+
+  # --- SNS Topic for Approval ---
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cicd-demo-approval
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref ApprovalNotifyEmail
+
+  # --- CodeBuild Role ---
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cicd-demo-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub ${ArtifactBucket.Arn}/*
+                  - !Sub ${DeployArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:GetApplicationRevision
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${EKSClusterName}
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "*"
+
+  # --- CodeBuild Project: Dev (test + package + deploy via CodeDeploy) ---
+  CodeBuildDevProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cicd-demo-dev-build
+      Description: Run tests and deploy to dev EC2 via CodeDeploy
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: S3_BUCKET_NAME
+            Value: !Ref DeployArtifactBucket
+          - Name: CODEDEPLOY_APP
+            Value: cicd-demo
+          - Name: CODEDEPLOY_GROUP
+            Value: dev-deployment-group
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-dev.yml
+      TimeoutInMinutes: 15
+
+  # --- CodeBuild Project: Prod (build image + deploy to EKS) ---
+  CodeBuildProdProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cicd-demo-prod-build
+      Description: Build Docker image and deploy to EKS production
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_NAME
+            Value: !Ref ECRRepoName
+          - Name: EKS_CLUSTER_NAME
+            Value: !Ref EKSClusterName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-prod.yml
+      TimeoutInMinutes: 20
+
+  # --- CodePipeline Role ---
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cicd-demo-pipeline-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - !GetAtt CodeBuildDevProject.Arn
+                  - !GetAtt CodeBuildProdProject.Arn
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ApprovalTopic
+
+  # --- The Pipeline ---
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: cicd-demo-pipeline
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        # Stage 1: Source from GitHub
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub ${GitHubOwner}/${GitHubRepo}
+                BranchName: !Ref GitHubBranch
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        # Stage 2: Build & Deploy to Dev (CodeBuild → CodeDeploy to EC2)
+        - Name: DeployToDev
+          Actions:
+            - Name: BuildAndDeployDev
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuildDevProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: DevBuildOutput
+
+        # Stage 3: Manual Approval
+        - Name: ApproveForProduction
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: "1"
+              Configuration:
+                NotificationArn: !Ref ApprovalTopic
+                CustomData: >
+                  Dev deployment successful. Review the dev environment
+                  and approve to proceed with production deployment to EKS.
+
+        # Stage 4: Build Image & Deploy to EKS Production
+        - Name: DeployToProduction
+          Actions:
+            - Name: BuildAndDeployProd
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuildProdProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: ProdBuildOutput
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  PipelineUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view
+  DevBuildProject:
+    Value: !Ref CodeBuildDevProject
+  ProdBuildProject:
+    Value: !Ref CodeBuildProdProject
+  ArtifactBucket:
+    Value: !Ref ArtifactBucket
+  DeployArtifactBucket:
+    Value: !Ref DeployArtifactBucket
