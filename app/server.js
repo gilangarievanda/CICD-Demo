@@ -7,6 +7,7 @@ app.get("/", (req, res) => {
     app: "cicd-demo",
     version: process.env.APP_VERSION || "1.0.0",
     environment: process.env.NODE_ENV || "development",
+    message: "Hello from EKS Auto Mode! 🚀",
     timestamp: new Date().toISOString(),
   });
 });

@@ -41,5 +41,5 @@ phases:
       - sed -i "s|VERSION_PLACEHOLDER|$IMAGE_TAG|g" k8s/deployment.yaml
       - kubectl apply -f k8s/
       - echo Waiting for rollout...
-      - kubectl rollout status deployment/cicd-demo --timeout=120s
+      - kubectl rollout status deployment/cicd-demo --timeout=300s
       - echo Deploy complete!
